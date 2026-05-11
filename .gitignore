@@ -1,0 +1,18 @@
+# Python 暫存與快取檔案
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虛擬環境
+.venv/
+venv/
+env/
+
+# 截圖產生的暫存圖片檔案
+temp_capture.png
+temp_v2_capture.png
+media__*.png
+media__*.jpg
+
+# 龐大的 Tesseract 模型資料夾 (不適合放入 Git)
+tessdata/

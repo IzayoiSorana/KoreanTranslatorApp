@@ -1,0 +1,5 @@
+easyocr
+deep-translator
+PyQt6
+pynput
+pillow
