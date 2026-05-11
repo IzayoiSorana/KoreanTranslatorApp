@@ -41,11 +41,26 @@ class OCREngine:
                 })
         return output
 
-# 🧩 模組 C：翻譯與防護模組
-class Translator:
+# 🧩 模組 C：翻譯引擎介面 (Strategy Pattern)
+class BaseTranslationEngine:
+    def translate(self, text: str, source: str, target: str) -> str:
+        raise NotImplementedError("必須由子類別實作此方法")
+
+class GoogleEngine(BaseTranslationEngine):
     def __init__(self):
-        # 未來若要擴充其他引擎 (例如 OpenAI, Papago)，只要在這裡新增切換邏輯即可
-        self.translator = GoogleTranslator(source='ko', target='zh-TW')
+        self.translator = GoogleTranslator()
+        
+    def translate(self, text: str, source: str, target: str) -> str:
+        self.translator.source = source
+        self.translator.target = target
+        return self.translator.translate(text)
+
+# 🧩 模組 C：翻譯與防護管線
+class Translator:
+    def __init__(self, engine: BaseTranslationEngine, source_lang='ko', target_lang='zh-TW'):
+        self.engine = engine
+        self.source = source_lang
+        self.target = target_lang
         
     def process(self, ocr_data):
         print(f"🌍 [模組 C] 準備單行獨立翻譯 {len(ocr_data)} 句文字...")
@@ -56,9 +71,9 @@ class Translator:
                 item["translated_text"] = text
                 continue
                 
-            # 呼叫 Google 翻譯
+            # 呼叫動態掛載的翻譯引擎
             try:
-                translated = self.translator.translate(text)
+                translated = self.engine.translate(text, self.source, self.target)
                 item["translated_text"] = translated if translated else text
             except Exception as e:
                 print(f"⚠️ 翻譯失敗 ({text}): {e}")
@@ -211,7 +226,9 @@ class TranslatorAppV2(QObject):
         
         # 初始化模組 B 與 C (會稍微花一點時間載入模型)
         self.ocr_engine = OCREngine()
-        self.translator = Translator()
+        # 動態組裝翻譯模組，未來只需抽換 GoogleEngine() 即可
+        translation_engine = GoogleEngine()
+        self.translator = Translator(engine=translation_engine, source_lang='ko', target_lang='zh-TW')
         
         print("👀 準備就緒！正在背景監聽快捷鍵：Win + Shift + Q ...")
 
