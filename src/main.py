@@ -3,8 +3,10 @@ import os
 import re
 import threading
 from PyQt6.QtWidgets import QApplication, QWidget, QScrollArea, QVBoxLayout, QLabel
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QRect, QPoint
-from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, QRect, QRectF, QPoint
+from PyQt6.QtGui import QPainter, QColor, QPen, QPixmap, QImage, QFont, QTextOption
+import cv2
+import numpy as np
 from pynput import keyboard
 import easyocr
 from deep_translator import GoogleTranslator
@@ -81,11 +83,97 @@ class Translator:
                 
         return ocr_data
 
-# 🧩 模組 E：檢視與儲存模組 (目前先作為除錯視覺化視窗)
+# 🧩 模組 D：影像合成模組
+class ImageRenderer:
+    def __init__(self, mode="inpaint"):
+        # mode 可以是 "inpaint" (魔法修補法) 或 "stroke" (文字描邊法)
+        self.mode = mode
+        
+    def qpixmap_to_cv(self, pixmap):
+        qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+        width = qimg.width()
+        height = qimg.height()
+        ptr = qimg.bits()
+        ptr.setsize(height * width * 3)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3))
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    def cv_to_qpixmap(self, cv_img):
+        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg)
+
+    def process(self, pixmap, ocr_data):
+        print(f"🎨 [模組 D] 啟動影像合成，使用模式: {self.mode}")
+        result_pixmap = pixmap.copy()
+        
+        if self.mode == "inpaint":
+            print("✨ 執行 OpenCV 魔法修補背景...")
+            cv_img = self.qpixmap_to_cv(result_pixmap)
+            # 建立黑色遮罩
+            mask = np.zeros(cv_img.shape[:2], dtype=np.uint8)
+            for item in ocr_data:
+                bbox = item['bbox']
+                pts = np.array([[int(p[0]), int(p[1])] for p in bbox], np.int32)
+                # 在遮罩上畫出白色的要修補的區域
+                cv2.fillPoly(mask, [pts], 255)
+            
+            # 使用 INPAINT_TELEA 演算法進行周圍像素填補
+            inpaint_radius = 5
+            cv_img = cv2.inpaint(cv_img, mask, inpaint_radius, cv2.INPAINT_TELEA)
+            result_pixmap = self.cv_to_qpixmap(cv_img)
+            
+        # 修正 HiDPI 螢幕縮放問題 (強制像素 1:1，避免畫錯位置)
+        result_pixmap.setDevicePixelRatio(1.0)
+        # 開始畫文字
+        painter = QPainter(result_pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 設定字型
+        font = QFont("Microsoft JhengHei", 12, QFont.Weight.Bold)
+        painter.setFont(font)
+        
+        # 設定自動換行與置中
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WordWrap)
+        option.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 為了取樣背景顏色，預先轉換一張 Image
+        img_for_sampling = result_pixmap.toImage()
+        
+        for item in ocr_data:
+            bbox = item['bbox']
+            # 計算外框的 X, Y, W, H
+            x_coords = [p[0] for p in bbox]
+            y_coords = [p[1] for p in bbox]
+            x = float(min(x_coords))
+            y = float(min(y_coords))
+            w = float(max(x_coords) - x)
+            h = float(max(y_coords) - y)
+            rect = QRectF(x, y, w, h)
+            text = item['translated_text']
+            
+            # --- 1. 畫出「白底」與「紅色邊框」 ---
+            # 稍微向外擴充，確保能完全遮蔽底下的韓文
+            bg_rect = rect.adjusted(-2, -2, 2, 2)
+            painter.setBrush(QColor(255, 255, 255)) # 純白底色
+            painter.setPen(QPen(QColor(255, 0, 0), 1)) # 紅色外框線，方便辨識偵測範圍
+            painter.drawRect(bg_rect)
+            
+            # --- 2. 畫上「黑色」主文字 ---
+            painter.setPen(QPen(QColor(0, 0, 0)))
+            painter.drawText(rect, text, option)
+            
+        painter.end()
+        return result_pixmap
+
+# 🧩 模組 E：檢視與儲存模組
 class ResultViewer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR 邊界框偵測預覽 (除錯模式)")
+        self.setWindowTitle("翻譯結果預覽")
         self.resize(800, 600)
         # 設定視窗在最上層，方便使用者查看
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
@@ -251,27 +339,13 @@ class TranslatorAppV2(QObject):
         for item in final_data:
             print(f"   [{item['text']}] -> [{item['translated_text']}]")
             
-        print("🛠️ 正在原圖上繪製 OCR 邊界框 (紅線)，供您確認範圍...")
-        debug_pixmap = pixmap.copy()
-        painter = QPainter(debug_pixmap)
-        pen = QPen(QColor(255, 0, 0), 2)
-        painter.setPen(pen)
+        print("🎨 準備進入模組 D (影像合成)...")
+        # 💡 您可以在這裡自由切換模式："inpaint" (魔法修補法) 或 "stroke" (文字描邊法)
+        renderer = ImageRenderer(mode="stroke")
+        final_pixmap = renderer.process(pixmap, final_data)
         
-        for item in final_data:
-            # EasyOCR 的座標格式為 4 個點: [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
-            bbox = item['bbox']
-            points = [QPoint(int(p[0]), int(p[1])) for p in bbox]
-            # 畫出四邊形的紅線框
-            for i in range(4):
-                painter.drawLine(points[i], points[(i+1)%4])
-        
-        painter.end()
-        
-        # 透過訊號將畫好紅線的圖片傳給主執行緒的 UI 顯示出來
-        self.signal_emitter.show_debug_image.emit(debug_pixmap)
-        
-        print("準備進入模組 D (影像合成)...")
-        # TODO: 呼叫模組 D 與 E 繪製並顯示結果
+        # 透過訊號將最終合成的圖片傳給主執行緒的 UI 顯示出來
+        self.signal_emitter.show_debug_image.emit(final_pixmap)
         
     def setup_hotkey(self):
         def on_activate():
