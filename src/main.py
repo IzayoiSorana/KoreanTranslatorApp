@@ -93,113 +93,214 @@ class ImageRenderer:
         qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
         width = qimg.width()
         height = qimg.height()
+        bpl = qimg.bytesPerLine()
+        
         ptr = qimg.bits()
-        ptr.setsize(height * width * 3)
-        arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 3))
+        ptr.setsize(height * bpl)
+        arr = np.frombuffer(ptr, np.uint8).reshape((height, bpl))
+        # 移除 Qt 用來對齊記憶體的 Padding 像素
+        arr = arr[:, :width * 3].reshape((height, width, 3))
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
     def cv_to_qpixmap(self, cv_img):
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        # 轉換為 RGB 並強制複製 (copy) 確保記憶體連續，避免 PyQt 讀取時花屏
+        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB).copy()
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         return QPixmap.fromImage(qimg)
 
+    def get_luminance(self, r, g, b):
+        return (r * 299 + g * 587 + b * 114) / 1000
+
+    def snap_color(self, r, g, b, is_text=False):
+        lum = self.get_luminance(r, g, b)
+        if not is_text: # 步驟 1：背景判定 (大於 200 變白，小於 50 變黑)
+            if lum > 200: return (255, 255, 255)
+            if lum < 50: return (0, 0, 0)
+            return (r, g, b)
+        else: # 步驟 2：文字對齊 (靠近白色轉白，靠近黑色轉黑)
+            if lum > 180: return (255, 255, 255)
+            if lum < 80: return (0, 0, 0)
+            return (r, g, b)
+
+    def get_luminance(self, r, g, b):
+        return (r * 299 + g * 587 + b * 114) / 1000
+
+    def snap_color(self, r, g, b, is_text=False):
+        lum = self.get_luminance(r, g, b)
+        if not is_text: # 背景判定
+            rgb_diff = max(r, g, b) - min(r, g, b)
+            
+            # 1. 亮度 > 235 直接給純白
+            # 2. 飽和度檢查：如果是淺灰色 (R,G,B 差值 < 20 且 亮度 > 210)，大膽轉純白
+            if lum > 235 or (lum > 210 and rgb_diff < 20): 
+                return (255, 255, 255)
+                
+            if lum < 50: return (0, 0, 0)
+            return (r, g, b)
+        else: # 文字對齊 (靠近白色轉白，靠近黑色轉黑)
+            if lum > 180: return (255, 255, 255)
+            if lum < 80: return (0, 0, 0)
+            return (r, g, b)
+
     def process(self, pixmap, ocr_data):
-        print(f"🎨 [模組 D] 啟動影像合成，使用模式: {self.mode}")
-        result_pixmap = pixmap.copy()
+        print(f"🎨 [模組 D] 啟動影像合成，使用全圖色彩分群與進階羽化模式...")
+        cv_img = self.qpixmap_to_cv(pixmap)
         
-        if self.mode == "inpaint":
-            print("✨ 執行 OpenCV 魔法修補背景...")
-            cv_img = self.qpixmap_to_cv(result_pixmap)
-            # 建立黑色遮罩
-            mask = np.zeros(cv_img.shape[:2], dtype=np.uint8)
-            for item in ocr_data:
-                bbox = item['bbox']
-                pts = np.array([[int(p[0]), int(p[1])] for p in bbox], np.int32)
-                # 在遮罩上畫出白色的要修補的區域
-                cv2.fillPoly(mask, [pts], 255)
-            
-            # 使用 INPAINT_TELEA 演算法進行周圍像素填補
-            inpaint_radius = 5
-            cv_img = cv2.inpaint(cv_img, mask, inpaint_radius, cv2.INPAINT_TELEA)
-            result_pixmap = self.cv_to_qpixmap(cv_img)
-            
-        # 修正 HiDPI 螢幕縮放問題 (強制像素 1:1，避免畫錯位置)
-        result_pixmap.setDevicePixelRatio(1.0)
-        # 開始畫文字
-        painter = QPainter(result_pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # 設定字型
-        font = QFont("Microsoft JhengHei", 12, QFont.Weight.Bold)
-        painter.setFont(font)
-        
-        # 設定自動換行與置中
-        option = QTextOption()
-        option.setWrapMode(QTextOption.WrapMode.WordWrap)
-        option.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        # 為了取樣背景顏色，預先轉換一張 Image
-        img_for_sampling = result_pixmap.toImage()
-        
+        # --- 第一階段：收集所有框的預設背景色 ---
+        all_task_info = []
         for item in ocr_data:
             bbox = item['bbox']
             x_coords = [p[0] for p in bbox]
             y_coords = [p[1] for p in bbox]
-            x = float(min(x_coords))
-            y = float(min(y_coords))
-            w = float(max(x_coords) - x)
-            h = float(max(y_coords) - y)
-            rect = QRectF(x, y, w, h)
+            x = int(min(x_coords))
+            y = int(min(y_coords))
+            w = int(max(x_coords) - x)
+            h = int(max(y_coords) - y)
             text = item['translated_text']
             
-            # --- 1. 背景與文字顏色自動適配 ---
-            # 採樣背景色 (取框正上方 2px)
-            bg_sample_x = int(max(0, x))
-            bg_sample_y = int(max(0, y - 2)) 
-            if bg_sample_x < img_for_sampling.width() and bg_sample_y < img_for_sampling.height():
-                bg_color = img_for_sampling.pixelColor(bg_sample_x, bg_sample_y)
-            else:
-                bg_color = QColor(255, 255, 255)
-                
-            # 採樣文字色 (取框正中央)
-            text_sample_x = int(x + w/2)
-            text_sample_y = int(y + h/2)
-            if text_sample_x < img_for_sampling.width() and text_sample_y < img_for_sampling.height():
-                text_color = img_for_sampling.pixelColor(text_sample_x, text_sample_y)
-            else:
-                text_color = QColor(0, 0, 0)
-                
-            # 防呆：確保對比度足夠，否則強制用黑或白
-            bg_lum = (bg_color.red() * 299 + bg_color.green() * 587 + bg_color.blue() * 114) / 1000
-            text_lum = (text_color.red() * 299 + text_color.green() * 587 + text_color.blue() * 114) / 1000
-            if abs(bg_lum - text_lum) < 60:
-                text_color = QColor(0, 0, 0) if bg_lum > 127 else QColor(255, 255, 255)
+            roi_y1 = max(0, y - 2)
+            roi_y2 = min(cv_img.shape[0], y + h + 2)
+            roi_x1 = max(0, x - 2)
+            roi_x2 = min(cv_img.shape[1], x + w + 2)
+            roi = cv_img[roi_y1:roi_y2, roi_x1:roi_x2]
             
-            # 畫出背景填補 (抹平原文字)
-            bg_rect = rect.adjusted(-2, -2, 2, 2)
-            painter.setBrush(bg_color)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(bg_rect)
+            if roi.size == 0: continue
             
-            # --- 2. 字體大小動態調整 (最佳縮放比例) ---
-            font_size = 18 # 初始最大字體
-            font = QFont("Microsoft JhengHei", font_size, QFont.Weight.Bold)
+            # 量化顏色
+            quantized = (roi // 32) * 32
+            pixels = quantized.reshape(-1, 3)
+            unique, counts = np.unique(pixels, axis=0, return_counts=True)
+            sorted_indices = np.argsort(-counts)
+            
+            bg_bgr = unique[sorted_indices[0]]
+            bg_r, bg_g, bg_b = int(bg_bgr[2]), int(bg_bgr[1]), int(bg_bgr[0])
+            raw_bg = self.snap_color(bg_r, bg_g, bg_b, is_text=False)
+            
+            all_task_info.append({
+                "x": x, "y": y, "w": w, "h": h,
+                "roi_x1": roi_x1, "roi_y1": roi_y1, "roi_x2": roi_x2, "roi_y2": roi_y2,
+                "text": text,
+                "raw_bg": raw_bg,
+                "unique_colors": unique,
+                "sorted_indices": sorted_indices
+            })
+            
+        # --- 第二階段：全圖色彩分群 (Global Color Grouping) ---
+        clusters = []
+        for task in all_task_info:
+            r, g, b = task['raw_bg']
+            found_cluster = False
+            for cluster in clusters:
+                cr, cg, cb = cluster['avg']
+                # 歐幾里得距離判斷顏色相似度，相近的顏色歸為同一群
+                dist = ((r-cr)**2 + (g-cg)**2 + (b-cb)**2) ** 0.5
+                if dist < 30: 
+                    cluster['sum_r'] += r
+                    cluster['sum_g'] += g
+                    cluster['sum_b'] += b
+                    cluster['count'] += 1
+                    cluster['avg'] = (
+                        int(cluster['sum_r']/cluster['count']),
+                        int(cluster['sum_g']/cluster['count']),
+                        int(cluster['sum_b']/cluster['count'])
+                    )
+                    task['cluster'] = cluster
+                    found_cluster = True
+                    break
+                    
+            if not found_cluster:
+                new_cluster = {"sum_r": r, "sum_g": g, "sum_b": b, "count": 1, "avg": (r, g, b)}
+                clusters.append(new_cluster)
+                task['cluster'] = new_cluster
+                
+        # --- 第三階段：套用群組色、羽化渲染與尋找文字色 ---
+        text_tasks = []
+        for task in all_task_info:
+            # 取得該群組的統一平均背景色
+            final_bg = task['cluster']['avg']
+            bg_lum = self.get_luminance(*final_bg)
+            
+            # 從原本的顏色分佈中，尋找對比度足夠的顏色作為文字色
+            unique = task['unique_colors']
+            sorted_indices = task['sorted_indices']
+            text_found = False
+            for i in range(1, len(sorted_indices)):
+                c_bgr = unique[sorted_indices[i]]
+                c_r, c_g, c_b = int(c_bgr[2]), int(c_bgr[1]), int(c_bgr[0])
+                c_lum = self.get_luminance(c_r, c_g, c_b)
+                if abs(c_lum - bg_lum) > 40: 
+                    text_r, text_g, text_b = c_r, c_g, c_b
+                    text_found = True
+                    break
+                    
+            if not text_found:
+                text_r, text_g, text_b = (0,0,0) if bg_lum > 127 else (255,255,255)
+                
+            final_text = self.snap_color(text_r, text_g, text_b, is_text=True)
+            text_lum = self.get_luminance(*final_text)
+            
+            if abs(bg_lum - text_lum) < 50:
+                final_text = (0, 0, 0) if bg_lum > 127 else (255, 255, 255)
+                
+            # 繪製漸層羽化遮罩 (Alpha Blur)
+            # 建立全圖大小的黑色遮罩
+            mask = np.zeros(cv_img.shape[:2], dtype=np.float32)
+            # 畫白色矩形前，先向外擴充幾像素，確保模糊後中心還是 100% 不透明
+            pad = 4
+            cv2.rectangle(mask, 
+                         (max(0, task['roi_x1'] - pad), max(0, task['roi_y1'] - pad)), 
+                         (min(cv_img.shape[1], task['roi_x2'] + pad), min(cv_img.shape[0], task['roi_y2'] + pad)), 
+                         1.0, -1)
+            # 使用非常大的 Kernel (21x21) 做出極為柔和的邊緣漸層過渡
+            mask = cv2.GaussianBlur(mask, (21, 21), 0)
+            
+            color_bgr = (final_bg[2], final_bg[1], final_bg[0])
+            solid_bg = np.full_like(cv_img, color_bgr)
+            
+            # 影像 alpha 混和
+            mask_3d = mask[:, :, np.newaxis]
+            cv_img[:] = cv_img * (1 - mask_3d) + solid_bg * mask_3d
+            
+            text_tasks.append({
+                "rect": QRectF(task['x'], task['y'], task['w'], task['h']),
+                "text": task['text'],
+                "color": QColor(*final_text)
+            })
+
+        # --- 第四階段：將影像轉回 PyQt 進行高畫質文字渲染 ---
+        result_pixmap = self.cv_to_qpixmap(cv_img)
+        result_pixmap.setDevicePixelRatio(1.0)
+        
+        painter = QPainter(result_pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        font_size = 18
+        font = QFont("Microsoft JhengHei", font_size, QFont.Weight.Bold)
+        
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WordWrap)
+        option.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        for task in text_tasks:
+            rect = task["rect"]
+            text = task["text"]
+            
+            current_font_size = font_size
+            font.setPointSize(current_font_size)
             painter.setFont(font)
-            
-            # 不斷縮小字體直到塞得進框框高度
             metrics = painter.fontMetrics()
-            text_rect = metrics.boundingRect(QRect(0, 0, int(w), int(h)), Qt.TextFlag.TextWordWrap, text)
-            while text_rect.height() > h and font_size > 8:
-                font_size -= 1
-                font.setPointSize(font_size)
+            text_rect = metrics.boundingRect(QRect(0, 0, int(rect.width()), int(rect.height())), Qt.TextFlag.TextWordWrap, text)
+            
+            while text_rect.height() > rect.height() and current_font_size > 8:
+                current_font_size -= 1
+                font.setPointSize(current_font_size)
                 painter.setFont(font)
                 metrics = painter.fontMetrics()
-                text_rect = metrics.boundingRect(QRect(0, 0, int(w), int(h)), Qt.TextFlag.TextWordWrap, text)
+                text_rect = metrics.boundingRect(QRect(0, 0, int(rect.width()), int(rect.height())), Qt.TextFlag.TextWordWrap, text)
             
-            # --- 3. 畫上文字 ---
-            painter.setPen(QPen(text_color))
+            painter.setPen(QPen(task["color"]))
             painter.drawText(rect, text, option)
             
         painter.end()
