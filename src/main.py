@@ -145,7 +145,6 @@ class ImageRenderer:
         
         for item in ocr_data:
             bbox = item['bbox']
-            # 計算外框的 X, Y, W, H
             x_coords = [p[0] for p in bbox]
             y_coords = [p[1] for p in bbox]
             x = float(min(x_coords))
@@ -155,15 +154,52 @@ class ImageRenderer:
             rect = QRectF(x, y, w, h)
             text = item['translated_text']
             
-            # --- 1. 畫出「白底」與「紅色邊框」 ---
-            # 稍微向外擴充，確保能完全遮蔽底下的韓文
+            # --- 1. 背景與文字顏色自動適配 ---
+            # 採樣背景色 (取框正上方 2px)
+            bg_sample_x = int(max(0, x))
+            bg_sample_y = int(max(0, y - 2)) 
+            if bg_sample_x < img_for_sampling.width() and bg_sample_y < img_for_sampling.height():
+                bg_color = img_for_sampling.pixelColor(bg_sample_x, bg_sample_y)
+            else:
+                bg_color = QColor(255, 255, 255)
+                
+            # 採樣文字色 (取框正中央)
+            text_sample_x = int(x + w/2)
+            text_sample_y = int(y + h/2)
+            if text_sample_x < img_for_sampling.width() and text_sample_y < img_for_sampling.height():
+                text_color = img_for_sampling.pixelColor(text_sample_x, text_sample_y)
+            else:
+                text_color = QColor(0, 0, 0)
+                
+            # 防呆：確保對比度足夠，否則強制用黑或白
+            bg_lum = (bg_color.red() * 299 + bg_color.green() * 587 + bg_color.blue() * 114) / 1000
+            text_lum = (text_color.red() * 299 + text_color.green() * 587 + text_color.blue() * 114) / 1000
+            if abs(bg_lum - text_lum) < 60:
+                text_color = QColor(0, 0, 0) if bg_lum > 127 else QColor(255, 255, 255)
+            
+            # 畫出背景填補 (抹平原文字)
             bg_rect = rect.adjusted(-2, -2, 2, 2)
-            painter.setBrush(QColor(255, 255, 255)) # 純白底色
-            painter.setPen(QPen(QColor(255, 0, 0), 1)) # 紅色外框線，方便辨識偵測範圍
+            painter.setBrush(bg_color)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRect(bg_rect)
             
-            # --- 2. 畫上「黑色」主文字 ---
-            painter.setPen(QPen(QColor(0, 0, 0)))
+            # --- 2. 字體大小動態調整 (最佳縮放比例) ---
+            font_size = 18 # 初始最大字體
+            font = QFont("Microsoft JhengHei", font_size, QFont.Weight.Bold)
+            painter.setFont(font)
+            
+            # 不斷縮小字體直到塞得進框框高度
+            metrics = painter.fontMetrics()
+            text_rect = metrics.boundingRect(QRect(0, 0, int(w), int(h)), Qt.TextFlag.TextWordWrap, text)
+            while text_rect.height() > h and font_size > 8:
+                font_size -= 1
+                font.setPointSize(font_size)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                text_rect = metrics.boundingRect(QRect(0, 0, int(w), int(h)), Qt.TextFlag.TextWordWrap, text)
+            
+            # --- 3. 畫上文字 ---
+            painter.setPen(QPen(text_color))
             painter.drawText(rect, text, option)
             
         painter.end()
